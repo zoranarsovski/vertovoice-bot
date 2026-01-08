@@ -27,6 +27,9 @@ claude_client = anthropic.Anthropic(api_key=os.environ.get("CLAUDE_API_KEY"))
 # Store processed events to avoid duplicates
 processed_events = set()
 
+# Store pending content awaiting voice selection: {thread_ts: {"content": str, "source": str, "channel": str}}
+pending_content = {}
+
 
 def extract_urls(text):
     """Extract URLs from message text"""
@@ -40,12 +43,14 @@ def extract_urls(text):
     return urls
 
 
-def generate_linkedin_drafts(content: str, source_url: str = None) -> dict:
+def generate_linkedin_drafts(content: str, source_url: str = None, voice: str = "zoran") -> dict:
     """Generate 2 LinkedIn post drafts using Claude"""
+
+    system_prompt = get_system_prompt(voice)
     
-    system_prompt = get_system_prompt()
-    
-    user_message = f"""Based on this content, create 2 different LinkedIn post drafts in Zoran's voice.
+    voice_name = "Zoran's voice" if voice == "zoran" else "VertoDigital's brand voice"
+
+    user_message = f"""Based on this content, create 2 different LinkedIn post drafts in {voice_name}.
 
 SOURCE CONTENT:
 {content[:8000]}  # Truncate if too long
@@ -60,7 +65,7 @@ Create 2 distinct versions:
 
 For each version:
 1. Keep it under 200 words
-2. Use Zoran's actual language patterns
+2. Use the appropriate language patterns for {voice_name}
 3. Tag relevant team members if their expertise applies
 4. Include a relevant social proof quote only if it fits naturally (don't force it)
 
@@ -68,7 +73,7 @@ Format your response as:
 ## Version A
 [post content]
 
-## Version B  
+## Version B
 [post content]
 """
     
@@ -95,16 +100,62 @@ Format your response as:
         }
 
 
-def send_slack_message(channel: str, text: str, thread_ts: str = None):
+def send_slack_message(channel: str, text: str, thread_ts: str = None, blocks: list = None):
     """Send a message to Slack"""
     try:
         slack_client.chat_postMessage(
             channel=channel,
             text=text,
-            thread_ts=thread_ts
+            thread_ts=thread_ts,
+            blocks=blocks
         )
     except SlackApiError as e:
         logger.error(f"Slack API error: {e}")
+
+
+def send_voice_selection_prompt(channel: str, thread_ts: str):
+    """Send interactive buttons to select voice"""
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "📝 Got it! Which voice should I use for the LinkedIn drafts?"
+            }
+        },
+        {
+            "type": "actions",
+            "block_id": "voice_selection",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "🧑 Zoran's Voice",
+                        "emoji": True
+                    },
+                    "value": "zoran",
+                    "action_id": "select_zoran"
+                },
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "🏢 VertoDigital",
+                        "emoji": True
+                    },
+                    "value": "vertodigital",
+                    "action_id": "select_vertodigital"
+                }
+            ]
+        }
+    ]
+    send_slack_message(
+        channel,
+        "Which voice should I use for the LinkedIn drafts?",
+        thread_ts,
+        blocks
+    )
 
 
 @app.route("/", methods=["GET"])
@@ -113,11 +164,77 @@ def health_check():
     return jsonify({"status": "ok", "service": "VertoVoice Bot"})
 
 
+@app.route("/slack/interactivity", methods=["POST"])
+def slack_interactivity():
+    """Handle Slack interactive components (button clicks)"""
+    payload = json.loads(request.form.get("payload", "{}"))
+
+    if payload.get("type") == "block_actions":
+        actions = payload.get("actions", [])
+        if actions:
+            action = actions[0]
+            action_id = action.get("action_id", "")
+            voice = action.get("value", "zoran")
+
+            # Get context from payload
+            channel = payload.get("channel", {}).get("id")
+            message_ts = payload.get("message", {}).get("ts")
+            thread_ts = payload.get("message", {}).get("thread_ts") or message_ts
+
+            # Look up pending content
+            pending_key = f"{channel}:{thread_ts}"
+            pending = pending_content.get(pending_key)
+
+            if pending:
+                # Remove from pending
+                del pending_content[pending_key]
+
+                # Send "generating" message
+                voice_label = "Zoran's voice" if voice == "zoran" else "VertoDigital's brand voice"
+                send_slack_message(
+                    channel,
+                    f"✨ Generating drafts in {voice_label}...",
+                    thread_ts
+                )
+
+                # Generate drafts
+                result = generate_linkedin_drafts(
+                    pending["content"],
+                    pending.get("source"),
+                    voice
+                )
+
+                if result["success"]:
+                    source_text = f"\n_Source: {pending['source']}_" if pending.get("source") else ""
+                    response_text = f"""✨ *Here are 2 LinkedIn post drafts ({voice_label}):*
+
+{result['drafts']}
+
+---{source_text}
+_Edit as needed, then post!_"""
+
+                    send_slack_message(channel, response_text, thread_ts)
+                else:
+                    send_slack_message(
+                        channel,
+                        f"❌ Error generating drafts: {result['error']}",
+                        thread_ts
+                    )
+            else:
+                send_slack_message(
+                    channel,
+                    "❌ Sorry, I couldn't find the content for this request. Please share the link or file again.",
+                    thread_ts
+                )
+
+    return jsonify({"status": "ok"})
+
+
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     """Handle Slack events"""
     data = request.json
-    
+
     # Handle Slack URL verification challenge
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data.get("challenge")})
@@ -184,18 +301,18 @@ def handle_urls_in_message(event, urls):
 
 
 def process_url(channel: str, url: str, thread_ts: str = None):
-    """Process a URL and generate drafts"""
-    
-    # Send "working on it" message
+    """Process a URL and ask for voice selection"""
+
+    # Send "extracting" message
     send_slack_message(
         channel,
-        "📝 Got it! Extracting content and generating drafts...",
+        "📝 Extracting content from the URL...",
         thread_ts
     )
-    
+
     # Extract content from URL
     content = extract_from_url(url)
-    
+
     if not content:
         send_slack_message(
             channel,
@@ -203,70 +320,60 @@ def process_url(channel: str, url: str, thread_ts: str = None):
             thread_ts
         )
         return
-    
-    # Generate drafts
-    result = generate_linkedin_drafts(content, url)
-    
-    if result["success"]:
-        response_text = f"""✨ *Here are 2 LinkedIn post drafts:*
 
-{result['drafts']}
+    # Store content for later processing
+    pending_key = f"{channel}:{thread_ts}"
+    pending_content[pending_key] = {
+        "content": content,
+        "source": url,
+        "channel": channel
+    }
 
----
-_Source: {url}_
-_Edit as needed, then post!_"""
-        
-        send_slack_message(channel, response_text, thread_ts)
-    else:
-        send_slack_message(
-            channel,
-            f"❌ Error generating drafts: {result['error']}",
-            thread_ts
-        )
+    # Limit pending content cache size
+    if len(pending_content) > 100:
+        # Remove oldest entries
+        keys_to_remove = list(pending_content.keys())[:50]
+        for key in keys_to_remove:
+            del pending_content[key]
+
+    # Ask for voice selection
+    send_voice_selection_prompt(channel, thread_ts)
 
 
 def handle_file_shared(event, files):
     """Handle file uploads (PDFs)"""
     channel = event.get("channel")
     thread_ts = event.get("ts")
-    
+
     for file in files:
         filetype = file.get("filetype", "").lower()
-        
+
         if filetype == "pdf":
-            # Send "working on it" message
+            # Send "extracting" message
             send_slack_message(
                 channel,
-                "📝 Got the PDF! Extracting content and generating drafts...",
+                "📝 Got the PDF! Extracting content...",
                 thread_ts
             )
-            
+
             # Get file URL and download
             file_url = file.get("url_private_download")
             file_name = file.get("name", "document.pdf")
-            
+
             if file_url:
                 content = extract_from_pdf(file_url, slack_client)
-                
+
                 if content:
-                    result = generate_linkedin_drafts(content)
-                    
-                    if result["success"]:
-                        response_text = f"""✨ *Here are 2 LinkedIn post drafts:*
+                    # Store content for later processing
+                    pending_key = f"{channel}:{thread_ts}"
+                    pending_content[pending_key] = {
+                        "content": content,
+                        "source": file_name,
+                        "channel": channel
+                    }
 
-{result['drafts']}
-
----
-_Source: {file_name}_
-_Edit as needed, then post!_"""
-                        
-                        send_slack_message(channel, response_text, thread_ts)
-                    else:
-                        send_slack_message(
-                            channel,
-                            f"❌ Error generating drafts: {result['error']}",
-                            thread_ts
-                        )
+                    # Ask for voice selection
+                    send_voice_selection_prompt(channel, thread_ts)
                 else:
                     send_slack_message(
                         channel,
