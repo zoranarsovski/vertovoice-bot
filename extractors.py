@@ -1,17 +1,112 @@
 """
 Content Extractors
-Extract text content from URLs and PDF files
+Extract text content from URLs, PDF files, and YouTube videos
 """
 
 import os
+import re
 import requests
 import tempfile
 import logging
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import PyPDF2
 
 logger = logging.getLogger(__name__)
+
+# YouTube URL patterns
+YOUTUBE_PATTERNS = [
+    r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
+    r'(?:https?://)?(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]{11})',
+    r'(?:https?://)?(?:www\.)?youtube\.com/v/([a-zA-Z0-9_-]{11})',
+    r'(?:https?://)?youtu\.be/([a-zA-Z0-9_-]{11})',
+    r'(?:https?://)?(?:www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]{11})',
+]
+
+
+def is_youtube_url(url: str) -> bool:
+    """Check if a URL is a YouTube video URL"""
+    for pattern in YOUTUBE_PATTERNS:
+        if re.search(pattern, url):
+            return True
+    return False
+
+
+def get_youtube_video_id(url: str) -> str:
+    """Extract the video ID from a YouTube URL"""
+    for pattern in YOUTUBE_PATTERNS:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def normalize_youtube_url(url: str) -> str:
+    """Convert any YouTube URL format to standard watch URL"""
+    video_id = get_youtube_video_id(url)
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return url
+
+
+def extract_from_youtube(url: str) -> dict:
+    """
+    Extract content from a YouTube video using Google Gemini API
+    Returns a dict with 'content' and 'is_youtube' flag
+    """
+    try:
+        from google import genai
+        from google.genai import types
+
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            logger.error("GEMINI_API_KEY not configured")
+            return {"content": None, "is_youtube": True, "error": "YouTube analysis not configured"}
+
+        # Normalize the URL
+        normalized_url = normalize_youtube_url(url)
+        video_id = get_youtube_video_id(url)
+
+        logger.info(f"Analyzing YouTube video: {normalized_url}")
+
+        # Initialize Gemini client
+        client = genai.Client(api_key=api_key)
+
+        # Analyze the video with Gemini
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=types.Content(
+                parts=[
+                    types.Part(
+                        file_data=types.FileData(file_uri=normalized_url)
+                    ),
+                    types.Part(text="""Analyze this YouTube video comprehensively. Provide:
+
+1. **Video Title/Topic**: What is this video about?
+2. **Key Points**: List the main points, insights, or arguments made (bullet points)
+3. **Notable Quotes**: Any memorable or impactful statements (with approximate timestamps if possible)
+4. **Target Audience**: Who would find this video valuable?
+5. **Main Takeaways**: 2-3 actionable insights or lessons
+6. **Tone & Style**: How is the content presented? (educational, entertaining, professional, casual, etc.)
+
+Please be thorough but concise. This analysis will be used to create LinkedIn posts about the video content.""")
+                ]
+            )
+        )
+
+        content = response.text
+
+        if content:
+            # Add video reference
+            content = f"# YouTube Video Analysis\n\nVideo URL: {normalized_url}\n\n{content}"
+            logger.info(f"Successfully analyzed YouTube video: {video_id}")
+            return {"content": content, "is_youtube": True, "video_id": video_id}
+        else:
+            return {"content": None, "is_youtube": True, "error": "No content extracted from video"}
+
+    except Exception as e:
+        logger.error(f"Error analyzing YouTube video {url}: {e}")
+        return {"content": None, "is_youtube": True, "error": str(e)}
 
 # Headers to mimic browser request
 HEADERS = {

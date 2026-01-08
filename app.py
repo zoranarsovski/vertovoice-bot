@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import anthropic
-from extractors import extract_from_url, extract_from_pdf
+from extractors import extract_from_url, extract_from_pdf, is_youtube_url, extract_from_youtube
 from prompts import get_system_prompt
 
 # Configure logging
@@ -303,23 +303,52 @@ def handle_urls_in_message(event, urls):
 def process_url(channel: str, url: str, thread_ts: str = None):
     """Process a URL and ask for voice selection"""
 
-    # Send "extracting" message
-    send_slack_message(
-        channel,
-        "📝 Extracting content from the URL...",
-        thread_ts
-    )
-
-    # Extract content from URL
-    content = extract_from_url(url)
-
-    if not content:
+    # Check if it's a YouTube URL
+    if is_youtube_url(url):
+        # Send "analyzing video" message
         send_slack_message(
             channel,
-            "❌ Couldn't extract content from that URL. Try sharing a different link or uploading a PDF.",
+            "🎬 Got a YouTube video! Analyzing with Gemini AI (this may take a moment)...",
             thread_ts
         )
-        return
+
+        # Extract content from YouTube using Gemini
+        result = extract_from_youtube(url)
+
+        if result.get("error"):
+            send_slack_message(
+                channel,
+                f"❌ Couldn't analyze the YouTube video: {result['error']}",
+                thread_ts
+            )
+            return
+
+        content = result.get("content")
+        if not content:
+            send_slack_message(
+                channel,
+                "❌ Couldn't extract content from that YouTube video. Make sure it's a public video.",
+                thread_ts
+            )
+            return
+    else:
+        # Send "extracting" message for regular URLs
+        send_slack_message(
+            channel,
+            "📝 Extracting content from the URL...",
+            thread_ts
+        )
+
+        # Extract content from regular URL
+        content = extract_from_url(url)
+
+        if not content:
+            send_slack_message(
+                channel,
+                "❌ Couldn't extract content from that URL. Try sharing a different link or uploading a PDF.",
+                thread_ts
+            )
+            return
 
     # Store content for later processing
     pending_key = f"{channel}:{thread_ts}"
