@@ -74,7 +74,7 @@ def extract_from_youtube(url: str) -> dict:
 
         # Analyze the video with Gemini
         response = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.0-flash-001',
             contents=types.Content(
                 parts=[
                     types.Part(
